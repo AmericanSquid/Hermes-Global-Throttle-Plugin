@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+import time
+from typing import Any, Callable
 
 
 DEFAULT_WORKLOAD_WEIGHTS: dict[str, float] = {
@@ -80,21 +81,48 @@ class WeightedCapacityPool:
         with self._cv:
             return key, self._weights.get(key, self._weights["other"])
 
-    def acquire(self, request_id: str, workload_type: str | None = None) -> tuple[str, float]:
+    def acquire(
+        self,
+        request_id: str,
+        workload_type: str | None = None,
+        tool_name: str | None = None,
+        session_id: str | None = None,
+        on_stall: Callable[[str, float, float, float, str | None, str | None], None] | None = None,
+        on_unblock: Callable[[str, float, str | None, str | None], None] | None = None,
+        stall_threshold: float = 2.0,
+    ) -> tuple[str, float]:
         key, weight = self.weight_for(workload_type)
+        start_mono = time.monotonic()
+        stall_reported = False
         with self._cv:
             ticket = self._next_ticket
             self._next_ticket += 1
             try:
                 while ticket != self._serving_ticket:
-                    self._cv.wait(timeout=1.0)
+                    waited = time.monotonic() - start_mono
+                    if waited >= stall_threshold and not stall_reported:
+                        stall_reported = True
+                        if on_stall is not None:
+                            used = sum(item["weight"] for item in self._active.values())
+                            on_stall(key, weight, used, self._capacity, tool_name, session_id)
+                    wait_slice = max(0.05, min(0.5, stall_threshold - waited if not stall_reported else 0.5))
+                    self._cv.wait(timeout=wait_slice)
+
                 # A single work item must always be admissible, even if a
                 # future resource policy lowers capacity below its weight.
                 required_capacity = max(self._capacity, weight)
                 # Existing reservations remain untouched when capacity is
                 # constrained. This loop only delays *this* new admission.
                 while sum(item["weight"] for item in self._active.values()) + weight > required_capacity:
-                    self._cv.wait(timeout=1.0)
+                    waited = time.monotonic() - start_mono
+                    if waited >= stall_threshold and not stall_reported:
+                        stall_reported = True
+                        if on_stall is not None:
+                            used = sum(item["weight"] for item in self._active.values())
+                            on_stall(key, weight, used, self._capacity, tool_name, session_id)
+                    wait_slice = max(0.05, min(0.5, stall_threshold - waited if not stall_reported else 0.5))
+                    self._cv.wait(timeout=wait_slice)
+
                 self._active[request_id] = {
                     "workload_type": key,
                     "weight": weight,
@@ -114,6 +142,9 @@ class WeightedCapacityPool:
                 self._cancelled_tickets.remove(self._serving_ticket)
                 self._serving_ticket += 1
             self._cv.notify_all()
+
+        if stall_reported and on_unblock is not None:
+            on_unblock(key, weight, tool_name, session_id)
         return key, weight
 
     def release(self, request_id: str) -> bool:

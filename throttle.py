@@ -27,6 +27,11 @@ try:
 except (ImportError, ModuleNotFoundError):
     from adaptive_capacity import AdaptiveCapacityController
 
+try:
+    from .progress_emitter import ProgressEmitter
+except (ImportError, ModuleNotFoundError):
+    from progress_emitter import ProgressEmitter
+
 
 PLUGIN_STATE_KEY = "global_throttle_state"
 STATE_VERSION = 1
@@ -1056,7 +1061,10 @@ class ThrottleBucket:
         provider: str,
         model: str,
         before_dispatch: Callable[[], None] | None = None,
+        session_id: str | None = None,
     ) -> None:
+        start_mono = time.monotonic()
+        stall_reported = False
         while True:
             wait_for, reason, settings = self._check_wait_locked(
                 request_id, estimated_tokens, provider, model
@@ -1071,13 +1079,27 @@ class ThrottleBucket:
             if wait_for > 0.001:
                 self._last_wait_seconds = wait_for
                 self._last_delay_reason = reason
-                self._cv.wait(timeout=min(wait_for, 1.0))
+                total_waited = time.monotonic() - start_mono
+                if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+                    stall_reported = True
+                    self._controller._emitter.emit(
+                        f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                        emoji="⏳",
+                        session_id=session_id,
+                    )
+                self._cv.wait(timeout=min(wait_for, 0.5))
                 continue
 
             if before_dispatch is not None:
                 before_dispatch()
             self._record_dispatch_locked(request_id, estimated_tokens, provider, model)
             self._controller._persist_locked()
+            if stall_reported:
+                self._controller._emitter.emit(
+                    f"Throttle: Pacing wait complete, dispatching {provider}/{model}",
+                    emoji="⚡",
+                    session_id=session_id,
+                )
             return
 
     def on_success(
@@ -1158,6 +1180,7 @@ class GlobalThrottle:
 
     def __init__(self, ctx):
         self.ctx = ctx
+        self._emitter = ProgressEmitter(ctx)
         self._cv = threading.Condition(threading.RLock())
 
         self._pending: dict[str, PendingRequest] = {}
@@ -1228,19 +1251,52 @@ class GlobalThrottle:
     def capacity_pool(self) -> WeightedCapacityPool:
         return self._capacity_pool
 
-    def acquire_workload(self, request_id: str, workload_type: str = "llm_api") -> tuple[str, float]:
+    def acquire_workload(
+        self,
+        request_id: str,
+        workload_type: str = "llm_api",
+        tool_name: str | None = None,
+        session_id: str | None = None,
+    ) -> tuple[str, float]:
         """Wait for and reserve capacity from the one global workload pool."""
-        self.refresh_resource_capacity()
-        return self._capacity_pool.acquire(request_id, workload_type)
+        self.refresh_resource_capacity(session_id=session_id)
+
+        def _on_stall(key: str, weight: float, used: float, capacity: float, tool_n: str | None, sess_id: str | None):
+            target = tool_n or key
+            self._emitter.emit(
+                f"Throttle: Waiting for workload capacity ({target}, running: {used:.1f}/{capacity:.1f})...",
+                emoji="⏳",
+                tool_name="throttle",
+                session_id=sess_id,
+            )
+
+        def _on_unblock(key: str, weight: float, tool_n: str | None, sess_id: str | None):
+            target = tool_n or key
+            self._emitter.emit(
+                f"Throttle: Capacity acquired, resuming {target}",
+                emoji="⚡",
+                tool_name="throttle",
+                session_id=sess_id,
+            )
+
+        return self._capacity_pool.acquire(
+            request_id,
+            workload_type,
+            tool_name=tool_name,
+            session_id=session_id,
+            on_stall=_on_stall,
+            on_unblock=_on_unblock,
+        )
 
     def release_workload(self, request_id: str) -> bool:
         """Release a previously acquired global workload reservation."""
         return self._capacity_pool.release(request_id)
 
-    def refresh_resource_capacity(self, force_sample: bool = False) -> float:
+    def refresh_resource_capacity(self, force_sample: bool = False, session_id: str | None = None) -> float:
         """Sample resources when due and apply the persisted learned capacity."""
         with self._capacity_control_lock:
             ceiling = self._capacity_units()
+            old_cap = self._capacity_pool.capacity
             snapshot = self._resource_sampler.maybe_sample(force=force_sample)
             if snapshot is not None:
                 capacity = self._adaptive_capacity.observe(snapshot, ceiling)
@@ -1248,6 +1304,20 @@ class GlobalThrottle:
             else:
                 capacity = self._adaptive_capacity.current_capacity(ceiling)
             self._capacity_pool.set_capacity(capacity)
+
+            if abs(capacity - old_cap) >= 0.5:
+                if capacity < old_cap:
+                    self._emitter.emit(
+                        f"Throttle: High host pressure detected, capacity clamped ({old_cap:.1f} → {capacity:.1f})",
+                        emoji="⚠️",
+                        session_id=session_id,
+                    )
+                else:
+                    self._emitter.emit(
+                        f"Throttle: Host resources stable, capacity recovering ({old_cap:.1f} → {capacity:.1f})",
+                        emoji="📈",
+                        session_id=session_id,
+                    )
             return capacity
 
     @property
@@ -2189,11 +2259,19 @@ class GlobalThrottle:
         capacity_request_id = f"llm:{request_id}"
         use_capacity_pool = not is_local_model_execution(provider, base_url, model)
         capacity_acquired = False
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id and len(args) == 1 and isinstance(args[0], dict):
+            session_id = str(args[0].get("session_id") or "")
 
         def acquire_capacity_at_dispatch() -> None:
             nonlocal capacity_acquired
             if use_capacity_pool and not capacity_acquired:
-                self.acquire_workload(capacity_request_id, workload_type)
+                self.acquire_workload(
+                    capacity_request_id,
+                    workload_type,
+                    tool_name=f"{provider}/{model}",
+                    session_id=session_id,
+                )
                 capacity_acquired = True
 
         try:
@@ -2201,6 +2279,7 @@ class GlobalThrottle:
                 self._dispatch_single_bucket(
                     buckets[0], request_id, estimated_tokens, provider, model,
                     kwargs, before_dispatch=acquire_capacity_at_dispatch,
+                    session_id=session_id,
                 )
             else:
                 b_prov = next(b for b in buckets if b.scope_type == "provider")
@@ -2208,6 +2287,7 @@ class GlobalThrottle:
                 self._dispatch_two_buckets(
                     b_mod, b_prov, request_id, estimated_tokens, provider, model,
                     kwargs, before_dispatch=acquire_capacity_at_dispatch,
+                    session_id=session_id,
                 )
         except BaseException:
             if capacity_acquired:
@@ -2233,6 +2313,7 @@ class GlobalThrottle:
         tool_args = kwargs.get("args")
         next_call = kwargs.get("next_call")
         tool_call_id = str(kwargs.get("tool_call_id") or "")
+        session_id = str(kwargs.get("session_id") or "")
 
         if len(args) == 1 and isinstance(args[0], dict):
             context = args[0]
@@ -2240,6 +2321,7 @@ class GlobalThrottle:
             tool_args = tool_args if tool_args is not None else context.get("args")
             next_call = next_call or context.get("next_call")
             tool_call_id = tool_call_id or str(context.get("tool_call_id") or "")
+            session_id = session_id or str(context.get("session_id") or "")
         elif len(args) >= 3:
             tool_name = tool_name or str(args[0] or "")
             tool_args = tool_args if tool_args is not None else args[1]
@@ -2252,7 +2334,12 @@ class GlobalThrottle:
             return next_call(tool_args)
 
         reservation_id = f"tool:{tool_call_id or uuid.uuid4().hex}"
-        self.acquire_workload(reservation_id, workload_type)
+        self.acquire_workload(
+            reservation_id,
+            workload_type,
+            tool_name=tool_name,
+            session_id=session_id,
+        )
 
         if workload_type == "subagent":
             # This is a start gate. Releasing before delegate_task runs avoids
@@ -2274,6 +2361,7 @@ class GlobalThrottle:
         model: str,
         context: dict[str, Any],
         before_dispatch: Callable[[], None] | None = None,
+        session_id: str | None = None,
     ) -> None:
         ticket = bucket.claim_ticket()
         try:
@@ -2286,6 +2374,7 @@ class GlobalThrottle:
                     provider,
                     model,
                     before_dispatch=before_dispatch,
+                    session_id=session_id,
                 )
         except BaseException:
             bucket.release_reservation(request_id)
@@ -2303,8 +2392,11 @@ class GlobalThrottle:
         model: str,
         context: dict[str, Any],
         before_dispatch: Callable[[], None] | None = None,
+        session_id: str | None = None,
     ) -> None:
         ticket_mod = b_mod.claim_ticket()
+        start_mono = time.monotonic()
+        stall_reported = False
         try:
             with b_mod._cv:
                 while ticket_mod != b_mod._serving_ticket:
@@ -2321,7 +2413,15 @@ class GlobalThrottle:
                     if wait_for > 0.001:
                         b_mod._last_wait_seconds = wait_for
                         b_mod._last_delay_reason = reason
-                        b_mod._cv.wait(timeout=min(wait_for, 1.0))
+                        total_waited = time.monotonic() - start_mono
+                        if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+                            stall_reported = True
+                            self._emitter.emit(
+                                f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                                emoji="⏳",
+                                session_id=session_id,
+                            )
+                        b_mod._cv.wait(timeout=min(wait_for, 0.5))
                         continue
                     break
 
@@ -2342,7 +2442,15 @@ class GlobalThrottle:
                         if wait_for > 0.001:
                             b_prov._last_wait_seconds = wait_for
                             b_prov._last_delay_reason = reason
-                            b_prov._cv.wait(timeout=min(wait_for, 1.0))
+                            total_waited = time.monotonic() - start_mono
+                            if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+                                stall_reported = True
+                                self._emitter.emit(
+                                    f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                                    emoji="⏳",
+                                    session_id=session_id,
+                                )
+                            b_prov._cv.wait(timeout=min(wait_for, 0.5))
                             continue
                         break
 
@@ -2352,6 +2460,12 @@ class GlobalThrottle:
                         b_mod._record_dispatch_locked(request_id, estimated_tokens, provider, model)
                     b_prov._record_dispatch_locked(request_id, estimated_tokens, provider, model)
                     self._persist_locked()
+                    if stall_reported:
+                        self._emitter.emit(
+                            f"Throttle: Pacing wait complete, dispatching {provider}/{model}",
+                            emoji="⚡",
+                            session_id=session_id,
+                        )
             except BaseException:
                 b_prov.release_reservation(request_id)
                 raise
@@ -2562,6 +2676,12 @@ class GlobalThrottle:
             entry["last_error_at"] = now
 
             if is_429:
+                sess_id = str(kwargs.get("session_id") or "")
+                self._emitter.emit(
+                    f"Throttle: {provider} returned 429 rate limit, backing off...",
+                    emoji="🚨",
+                    session_id=sess_id,
+                )
                 entry["rate_limit_429s"] = int(_num(entry.get("rate_limit_429s"), 0)) + 1
                 entry["last_429_at"] = now
 
@@ -2585,6 +2705,14 @@ class GlobalThrottle:
                     default_rpm=settings.rpm,
                     default_tpm=settings.tpm,
                     target_dimension=target_dim,
+                )
+                new_rpm, new_tpm = self._learner.get_effective_limits(
+                    provider, model, settings.rpm, settings.tpm
+                )
+                self._emitter.emit(
+                    f"Throttle: Learned lower rate limit for {provider}/{model} ({new_rpm:.0f} RPM, {new_tpm:.0f} TPM)",
+                    emoji="🧠",
+                    session_id=sess_id,
                 )
 
             if request_id:
@@ -2613,12 +2741,14 @@ class GlobalThrottle:
             self._set_config("enabled", True)
             with self._cv:
                 self._cv.notify_all()
+            self._emitter.emit("Throttle enabled", emoji="⚙️")
             return "Throttle enabled."
 
         if cmd in {"off", "disable", "disabled"}:
             self._set_config("enabled", False)
             with self._cv:
                 self._cv.notify_all()
+            self._emitter.emit("Throttle disabled", emoji="⚙️")
             return "Throttle disabled."
 
         if cmd == "reset":
@@ -2638,6 +2768,7 @@ class GlobalThrottle:
                     b_adaptive["error_streak"] = 0
                 self._persist_locked()
                 self._cv.notify_all()
+            self._emitter.emit("Adaptive rate factor and cooldown reset", emoji="⚙️")
             return "Adaptive rate factor and cooldown have been reset."
 
         setters = {
@@ -2664,6 +2795,7 @@ class GlobalThrottle:
             self._set_config(key, value)
             with self._cv:
                 self._cv.notify_all()
+            self._emitter.emit(f"Throttle {label} set to {value}", emoji="⚙️")
             return f"{label} set to {value}."
 
         if cmd in {"reset-learning", "reset_learning"}:
@@ -2681,6 +2813,7 @@ class GlobalThrottle:
                 self._persist_locked()
                 self._cv.notify_all()
             if reset:
+                self._emitter.emit(f"Learned limits reset for {prov}::{mod}", emoji="⚙️")
                 return f"Learned limits reset for {prov}::{mod}."
             return f"No learned limits found for {prov}::{mod}."
 
@@ -2699,6 +2832,7 @@ class GlobalThrottle:
                 self._persist_locked()
                 self._cv.notify_all()
             if recalibrated:
+                self._emitter.emit(f"Recalibration started for {prov}::{mod}", emoji="⚙️")
                 return f"Recalibration started for {prov}::{mod}."
             return f"No learned limits found for {prov}::{mod}."
 
@@ -2842,6 +2976,7 @@ class GlobalThrottle:
 
         self.set_override(scope, **parsed_values)
         summary = ", ".join(f"{k.upper()}={v}" for k, v in sorted(parsed_values.items()))
+        self._emitter.emit(f"Override set for {scope}: {summary}", emoji="⚙️")
         return f"Set override for {scope}: {summary}."
 
     def _parse_remove_override(self, parts: list[str]) -> str:
@@ -2878,11 +3013,13 @@ class GlobalThrottle:
             field_name = valid_map[param]
             removed = self.remove_override(scope, param=field_name)
             if removed:
+                self._emitter.emit(f"Removed {param.upper()} override for {scope}", emoji="⚙️")
                 return f"Removed {param.upper()} override for {scope}."
             return f"No {param.upper()} override found for {scope}."
         else:
             removed = self.remove_override(scope)
             if removed:
+                self._emitter.emit(f"Override removed for {scope}", emoji="⚙️")
                 return f"Override removed for {scope}."
             return f"No override found for {scope}."
 
