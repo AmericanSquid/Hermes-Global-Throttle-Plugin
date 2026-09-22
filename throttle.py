@@ -956,12 +956,18 @@ class ThrottleBucket:
 
         # Scoped RPD pacing from scope's own dispatch history
         scope_entry = self._controller._get_rpd_scope_entry_locked(scope_key, provider, model)
-        scope_last_mono = _num(scope_entry.get("last_dispatch_mono"), 0.0)
-        if scope_last_mono > 0 and rpd_delay > 0:
-            rpd_earliest = scope_last_mono + rpd_delay
+        scope_last_mono = self._controller._rpd_last_dispatch_mono.get(scope_key, 0.0)
+        if scope_last_mono > 0:
+            rpd_wait = max(0.0, scope_last_mono + rpd_delay - now_mono)
         else:
-            rpd_earliest = now_mono
-        rpd_wait = max(0.0, rpd_earliest - now_mono)
+            # After a restart, recover only the unelapsed spacing from the
+            # persisted wall clock; monotonic values belong to one process.
+            scope_last_wall = _num(scope_entry.get("last_dispatch_wall"), 0.0)
+            elapsed = (
+                max(0.0, now_wall - scope_last_wall)
+                if scope_last_wall > 0 else rpd_delay
+            )
+            rpd_wait = max(0.0, rpd_delay - elapsed)
 
         pacing_wait = max(rpm_tpm_wait, rpd_wait)
 
@@ -1162,6 +1168,7 @@ class GlobalThrottle:
 
         loaded = self._get_state(PLUGIN_STATE_KEY, default=None)
         self._state = self._normalize_state(loaded)
+        self._rpd_last_dispatch_mono: dict[str, float] = {}
         self._learner = BayesianRateLimitLearner(self._state.setdefault("learned_limits", {}))
         telemetry = self._state.get("telemetry")
         if not isinstance(telemetry, dict):
@@ -1570,6 +1577,9 @@ class GlobalThrottle:
         rpd_scopes = value.get("rpd_scopes")
         if isinstance(rpd_scopes, dict):
             base["rpd_scopes"] = copy.deepcopy(rpd_scopes)
+            for entry in base["rpd_scopes"].values():
+                if isinstance(entry, dict):
+                    entry.pop("last_dispatch_mono", None)
 
         day = base["day"]
         day["requests"] = max(0, int(_num(day.get("requests"), 0)))
@@ -1666,9 +1676,10 @@ class GlobalThrottle:
                 "timestamps": [],
                 "first_request_at": None,
                 "last_dispatch_wall": 0.0,
-                "last_dispatch_mono": 0.0,
             }
         entry = scopes[scope_key]
+        # Sanitize legacy or externally restored state before it is persisted.
+        entry.pop("last_dispatch_mono", None)
         if "timestamps" not in entry or not isinstance(entry["timestamps"], list):
             entry["timestamps"] = []
         if provider and not entry.get("provider"):
@@ -1727,7 +1738,7 @@ class GlobalThrottle:
         self._prune_rpd_scope_locked(entry, now_wall)
         entry["timestamps"].append(now_wall)
         entry["last_dispatch_wall"] = now_wall
-        entry["last_dispatch_mono"] = now_mono
+        self._rpd_last_dispatch_mono[scope_key] = now_mono
         if entry.get("first_request_at") is None:
             entry["first_request_at"] = now_wall
 

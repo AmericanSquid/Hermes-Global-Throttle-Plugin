@@ -1841,9 +1841,59 @@ class ScopedThrottleTests(unittest.TestCase):
         scope = throttle._get_rpd_scope_entry_locked("provider::model", "provider", "model")
         scope["timestamps"] = [time.time()]
         scope["first_request_at"] = time.time()
-        scope["last_dispatch_mono"] = time.monotonic()
+        scope["last_dispatch_wall"] = time.time()
         wait, _, _ = bucket._check_wait_locked("request", 30, "provider", "model")
         self.assertAlmostEqual(wait, 3600.0 / 999.0, delta=0.1)
+
+    def test_restart_recovers_remaining_rpd_spacing_and_discards_legacy_monotonic(self):
+        class LoadedState(dict):
+            def get(self, key, default=None):
+                return super().get(key, default)
+
+        now = time.time()
+        state = copy.deepcopy(self.throttle._state)
+        state["rpd_scopes"]["provider::model"] = {
+            "provider": "provider",
+            "model": "model",
+            "timestamps": [now - 5.0],
+            "first_request_at": now - 5.0,
+            "last_dispatch_wall": now - 5.0,
+            "last_dispatch_mono": time.monotonic() + 100000.0,
+        }
+        ctx = DummyPluginContext(
+            config=self.ctx.config.copy(), state=LoadedState({PLUGIN_STATE_KEY: state})
+        )
+        throttle = GlobalThrottle(ctx)
+        bucket = throttle.get_applicable_buckets("provider", "model")[0]
+
+        self.assertNotIn("last_dispatch_mono", throttle._state["rpd_scopes"]["provider::model"])
+        self.assertNotIn("last_dispatch_mono", ctx.state[PLUGIN_STATE_KEY]["rpd_scopes"]["provider::model"])
+        wait, reason, _ = bucket._check_wait_locked("request", 30, "provider", "model")
+        self.assertEqual(reason, "RPD")
+        self.assertAlmostEqual(wait, 10.0, delta=0.2)
+
+        throttle._state["rpd_scopes"]["provider::model"]["last_dispatch_wall"] = now - 60.0
+        throttle._state["rpd_scopes"]["provider::model"]["last_dispatch_mono"] = (
+            time.monotonic() + 100000.0
+        )
+        wait, _, _ = bucket._check_wait_locked("request", 30, "provider", "model")
+        self.assertEqual(wait, 0.0)
+        self.assertNotIn("last_dispatch_mono", throttle._state["rpd_scopes"]["provider::model"])
+
+    def test_in_process_rpd_spacing_uses_monotonic_dispatch_time(self):
+        throttle = GlobalThrottle(self.ctx)
+        bucket = throttle.get_applicable_buckets("provider", "model")[0]
+        scope_key = "provider::model"
+        throttle.record_rpd_dispatch_locked(
+            scope_key, time.time(), time.monotonic(), "provider", "model"
+        )
+        entry = throttle._get_rpd_scope_entry_locked(scope_key, "provider", "model")
+        entry["last_dispatch_wall"] -= 60.0
+
+        wait, reason, _ = bucket._check_wait_locked("request", 30, "provider", "model")
+        self.assertEqual(reason, "RPD")
+        self.assertAlmostEqual(wait, 15.0, delta=0.2)
+        self.assertNotIn("last_dispatch_mono", entry)
 
     def test_two_models_under_same_provider_do_not_block_each_other(self):
         # 7. Prevent one blocked bucket from blocking unrelated buckets.
@@ -2067,9 +2117,9 @@ class ScopedThrottleTests(unittest.TestCase):
         self.assertGreaterEqual(rpd_delay, 15.0)
         self.assertLessEqual(rpd_delay, 30.0)
 
-        # Set last_dispatch_mono into the past so the pacing interval has already elapsed
+        # Set dispatch times into the past so pacing has already elapsed
         with throttle._cv:
-            entry["last_dispatch_mono"] = time.monotonic() - 35.0
+            entry["last_dispatch_wall"] = time.time() - 35.0
             gemini_bucket = throttle.get_bucket("google::gemini-1.5-pro")
             gemini_bucket._last_dispatch_mono = time.monotonic() - 35.0
 
@@ -2094,7 +2144,7 @@ class ScopedThrottleTests(unittest.TestCase):
         # Seed Gemini scope to 500 requests (quota reached)
         g_entry = throttle._get_rpd_scope_entry_locked("google::gemini-1.5-pro", "google", "gemini-1.5-pro")
         g_entry["timestamps"] = [now - 50.0 + i * 0.1 for i in range(500)]
-        g_entry["last_dispatch_mono"] = time.monotonic()
+        g_entry["last_dispatch_wall"] = time.time()
 
         # Gemini bucket is pacing (would wait ~15s)
         g_bucket = throttle.get_bucket("google::gemini-1.5-pro")
