@@ -1,0 +1,49 @@
+manifest_version: 2
+api_version: 1
+name: hermes-global-throttle
+version: 0.1.0
+description: Global provider throttle and weighted workload capacity control for Hermes.
+author: Matt Wagner
+
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: Enable or disable the global throttle.
+  requests_per_minute:
+    type: int
+    default: 30
+    description: Maximum requests per minute.
+  tokens_per_minute:
+    type: int
+    default: 60000
+    description: Maximum tokens per minute.
+  requests_per_day:
+    type: int
+    default: 1000
+    description: Maximum requests per day.
+  make_daily_quota_last_hours:
+    type: float
+    default: 8.0
+    description: Try to spread the daily request allowance across this many hours.
+  longest_wait_between_requests:
+    type: float
+    default: 15.0
+    description: Maximum delay that daily-quota preservation alone may impose.
+  capacity_units:
+    type: float
+    default: 100.0
+    description: Total global weighted workload capacity.
+  workload_weights:
+    type: dict
+    default: {}
+    description: Optional overrides for global workload weights.
+  overrides:
+    type: dict
+    default: {}
+    description: Optional provider-level and provider::model rate limit overrides.
