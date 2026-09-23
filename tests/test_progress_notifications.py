@@ -297,6 +297,31 @@ class TestThrottleProgressIntegration(unittest.TestCase):
         self.assertIn("Extended wait for anthropic/claude", call_args[0][0])
         self.assertEqual(call_args[1].get("emoji"), "⏳")
 
+    def test_long_provider_pacing_names_the_limit_not_a_stale_wait(self):
+        """Known provider pacing stays distinct from FIFO/capacity contention."""
+        bucket = self.throttle._global_bucket
+        calls = [
+            (59.0, "TPM ceiling", self.throttle._settings()),
+            (0.0, "ok", self.throttle._settings()),
+        ]
+
+        def fake_check(*args, **kwargs):
+            return calls.pop(0) if calls else (0.0, "ok", self.throttle._settings())
+
+        with patch.object(bucket, "_check_wait_locked", side_effect=fake_check):
+            with patch("throttle.time.monotonic", side_effect=[0.0, 30.0, 31.0, 32.0]):
+                with bucket._cv:
+                    bucket._wait_until_dispatch_allowed_locked(
+                        "req-tpm", 100, "gemini", "flash"
+                    )
+
+        self.mock_emitter.emit.assert_called_once()
+        call_args = self.mock_emitter.emit.call_args
+        self.assertIn("Long TPM ceiling wait for gemini/flash", call_args[0][0])
+        self.assertIn("next pacing check 59.0s", call_args[0][0])
+        self.assertNotIn("Stale", call_args[0][0])
+        self.assertEqual(call_args[1].get("emoji"), "⏳")
+
     def test_burst_429_coalescing(self):
         """Burst 429 errors from multiple in-flight requests coalesce into a single backoff alert."""
         kwargs = {

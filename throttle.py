@@ -49,6 +49,18 @@ BURST_429_COOLDOWN = 15.0
 
 # Intentionally not user-facing knobs in v1.
 _EWMA_ALPHA = 0.20
+
+
+def _long_pacing_wait_message(
+    provider: str, model: str, reason: str, total_waited: float, wait_for: float
+) -> str:
+    """Describe an expected provider pacing delay without implying a deadlock."""
+    return (
+        f"Throttle: Long {reason} wait for {provider}/{model} "
+        f"(waiting {total_waited:.0f}s; next pacing check {wait_for:.1f}s)"
+    )
+
+
 _INITIAL_AVG_TOTAL_TOKENS = 2000.0
 _INITIAL_AVG_OUTPUT_TOKENS = 512.0
 _429_MULTIPLIER = 0.80
@@ -1097,12 +1109,15 @@ class ThrottleBucket:
                     provider, model, wait_for, total_waited, reason,
                 )
 
-                # Meaningful event: Stale wait (> 30s)
+                # Provider pacing can legitimately exceed 30 seconds. Include the
+                # limiting dimension rather than implying that work is stuck.
                 if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
                     stale_reported = True
                     self._controller._emitter.emit(
-                        f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
-                        emoji="⚠️",
+                        _long_pacing_wait_message(
+                            provider, model, reason, total_waited, wait_for
+                        ),
+                        emoji="⏳",
                         session_id=session_id,
                     )
                 # Meaningful event: Unusually long wait (> 10s)
@@ -2603,8 +2618,10 @@ class GlobalThrottle:
                         if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
                             stale_reported = True
                             self._emitter.emit(
-                                f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
-                                emoji="⚠️",
+                                _long_pacing_wait_message(
+                                    provider, model, reason, total_waited, wait_for
+                                ),
+                                emoji="⏳",
                                 session_id=session_id,
                             )
                         elif (wait_for >= UNUSUALLY_LONG_WAIT_THRESHOLD or total_waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
@@ -2655,8 +2672,10 @@ class GlobalThrottle:
                             if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
                                 stale_reported = True
                                 self._emitter.emit(
-                                    f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
-                                    emoji="⚠️",
+                                    _long_pacing_wait_message(
+                                        provider, model, reason, total_waited, wait_for
+                                    ),
+                                    emoji="⏳",
                                     session_id=session_id,
                                 )
                             elif (wait_for >= UNUSUALLY_LONG_WAIT_THRESHOLD or total_waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
