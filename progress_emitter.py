@@ -14,6 +14,10 @@ class ProgressEmitter:
     def __init__(self, ctx: Any = None):
         self._ctx = ctx
 
+    def emit_debug(self, message: str, *args: Any) -> None:
+        """Log routine progress at DEBUG level without forwarding to Discord/CLI."""
+        logger.debug("[throttle] " + message, *args)
+
     def emit(
         self,
         message: str,

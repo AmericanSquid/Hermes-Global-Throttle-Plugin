@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import random
 import re
@@ -11,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import urlparse
+
+logger = logging.getLogger("hermes.plugin.throttle")
 
 try:
     from .system_sampler import SystemResourceSampler
@@ -37,6 +40,12 @@ PLUGIN_STATE_KEY = "global_throttle_state"
 STATE_VERSION = 1
 CONFIDENCE_THRESHOLD = 0.70
 _NUM_PARTICLES = 30
+
+# Telemetry threshold constants
+UNUSUALLY_LONG_WAIT_THRESHOLD = 10.0
+STALE_WAIT_THRESHOLD = 30.0
+QUEUE_BUILDUP_THRESHOLD = 3
+BURST_429_COOLDOWN = 15.0
 
 # Intentionally not user-facing knobs in v1.
 _EWMA_ALPHA = 0.20
@@ -1065,6 +1074,7 @@ class ThrottleBucket:
     ) -> None:
         start_mono = time.monotonic()
         stall_reported = False
+        stale_reported = False
         while True:
             wait_for, reason, settings = self._check_wait_locked(
                 request_id, estimated_tokens, provider, model
@@ -1080,13 +1090,30 @@ class ThrottleBucket:
                 self._last_wait_seconds = wait_for
                 self._last_delay_reason = reason
                 total_waited = time.monotonic() - start_mono
-                if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+
+                # Routine pacing: keep in debug logs only
+                logger.debug(
+                    "[throttle] Pacing %s/%s (wait=%.2fs, total=%.2fs, reason=%s)",
+                    provider, model, wait_for, total_waited, reason,
+                )
+
+                # Meaningful event: Stale wait (> 30s)
+                if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                    stale_reported = True
+                    self._controller._emitter.emit(
+                        f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
+                        emoji="⚠️",
+                        session_id=session_id,
+                    )
+                # Meaningful event: Unusually long wait (> 10s)
+                elif (wait_for >= UNUSUALLY_LONG_WAIT_THRESHOLD or total_waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
                     stall_reported = True
                     self._controller._emitter.emit(
-                        f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                        f"Throttle: Extended wait for {provider}/{model} ({wait_for:.1f}s for {reason})...",
                         emoji="⏳",
                         session_id=session_id,
                     )
+
                 self._cv.wait(timeout=min(wait_for, 0.5))
                 continue
 
@@ -1094,12 +1121,12 @@ class ThrottleBucket:
                 before_dispatch()
             self._record_dispatch_locked(request_id, estimated_tokens, provider, model)
             self._controller._persist_locked()
-            if stall_reported:
-                self._controller._emitter.emit(
-                    f"Throttle: Pacing wait complete, dispatching {provider}/{model}",
-                    emoji="⚡",
-                    session_id=session_id,
-                )
+
+            # Routine dispatch completion: keep in debug logs only
+            logger.debug(
+                "[throttle] Pacing wait complete, dispatching %s/%s (waited %.2fs)",
+                provider, model, time.monotonic() - start_mono,
+            )
             return
 
     def on_success(
@@ -1129,7 +1156,10 @@ class ThrottleBucket:
                     provider, model, pending_success=True
                 ):
                     old_factor = _num(adaptive.get("factor"), 1.0)
-                    adaptive["factor"] = min(1.0, old_factor + _RECOVERY_STEP)
+                    new_factor = min(1.0, old_factor + _RECOVERY_STEP)
+                    adaptive["factor"] = new_factor
+                    if new_factor >= 1.0:
+                        self._controller.on_backoff_recovered(provider, model)
                 adaptive["successes_since_429"] = 0
             self._cv.notify_all()
 
@@ -1213,6 +1243,14 @@ class GlobalThrottle:
             weights=self._workload_weights(),
         )
 
+        # Telemetry tracking for meaningful events & summaries
+        self._backoff_active: dict[str, bool] = {}
+        self._last_429_notice: dict[str, float] = {}
+        self._last_learned_notice: dict[str, tuple[float, float]] = {}
+        self._resource_pressure_active = False
+        self._queue_buildup_active: dict[str, bool] = {}
+        self._last_queue_alert: dict[str, float] = {}
+
         # Root global bucket (default when no override exists)
         self._global_bucket = ThrottleBucket(
             key="global",
@@ -1235,6 +1273,38 @@ class GlobalThrottle:
         if isinstance(persisted, dict):
             for scope in persisted:
                 self.get_bucket(scope)
+
+    # ------------------ Telemetry Event Helpers ------------------------------
+
+    def on_backoff_recovered(self, provider: str, model: str = "") -> None:
+        """One-time notice when adaptive rate factor recovers after 429 backoff."""
+        with self._cv:
+            if self._backoff_active.pop(provider, False):
+                target = f"{provider}/{model}" if model else provider
+                self._emitter.emit(
+                    f"Throttle: Rate limit backoff recovered for {target}, normal pacing restored",
+                    emoji="✅",
+                )
+
+    def _check_queue_buildup(self, scope_name: str, queue_depth: int, session_id: str | None = None) -> None:
+        now = time.monotonic()
+        last_alert = self._last_queue_alert.get(scope_name, 0.0)
+        if queue_depth >= QUEUE_BUILDUP_THRESHOLD and (now - last_alert >= 30.0):
+            self._last_queue_alert[scope_name] = now
+            self._queue_buildup_active[scope_name] = True
+            self._emitter.emit(
+                f"Throttle: Queue buildup: {queue_depth} requests queued for {scope_name}",
+                emoji="⏳",
+                session_id=session_id,
+            )
+
+    def _check_queue_cleared(self, scope_name: str, session_id: str | None = None) -> None:
+        if self._queue_buildup_active.pop(scope_name, False):
+            self._emitter.emit(
+                f"Throttle: Queue cleared for {scope_name}, normal pacing resumed",
+                emoji="⚡",
+                session_id=session_id,
+            )
 
     # ------------------ Backward Compatibility Properties --------------------
 
@@ -1260,33 +1330,94 @@ class GlobalThrottle:
     ) -> tuple[str, float]:
         """Wait for and reserve capacity from the one global workload pool."""
         self.refresh_resource_capacity(session_id=session_id)
+        start_mono = time.monotonic()
+        stall_reported = False
+        stale_reported = False
 
         def _on_stall(key: str, weight: float, used: float, capacity: float, tool_n: str | None, sess_id: str | None):
-            target = tool_n or key
-            self._emitter.emit(
-                f"Throttle: Waiting for workload capacity ({target}, running: {used:.1f}/{capacity:.1f})...",
-                emoji="⏳",
-                tool_name="throttle",
-                session_id=sess_id,
+            nonlocal stall_reported, stale_reported
+            tgt = tool_n or key
+            waited = time.monotonic() - start_mono
+            logger.debug(
+                "[throttle] Workload capacity wait for %s (%.1fs, running: %.1f/%.1f)",
+                tgt, waited, used, capacity,
             )
+
+            # Check queue buildup in capacity pool
+            with self._capacity_pool._cv:
+                waiting_ops = max(0, self._capacity_pool._next_ticket - self._capacity_pool._serving_ticket - 1)
+            if waiting_ops >= QUEUE_BUILDUP_THRESHOLD:
+                now = time.monotonic()
+                if (now - self._last_queue_alert.get("capacity_pool", 0.0)) >= 30.0:
+                    self._last_queue_alert["capacity_pool"] = now
+                    self._queue_buildup_active["capacity_pool"] = True
+                    self._emitter.emit(
+                        f"Throttle: Queue buildup: {waiting_ops} operations waiting for capacity ({used:.1f}/{capacity:.1f} used)",
+                        emoji="⏳",
+                        session_id=sess_id,
+                    )
+
+            # Meaningful: Stale wait (> 30s)
+            if waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                stale_reported = True
+                self._emitter.emit(
+                    f"Throttle: Stale capacity wait detected for {tgt} (waiting {waited:.0f}s)",
+                    emoji="⚠️",
+                    session_id=sess_id,
+                )
+            # Meaningful: Unusually long wait (> 10s)
+            elif (waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
+                stall_reported = True
+                self._emitter.emit(
+                    f"Throttle: Extended capacity wait for {tgt} ({waited:.0f}s)...",
+                    emoji="⏳",
+                    session_id=sess_id,
+                )
 
         def _on_unblock(key: str, weight: float, tool_n: str | None, sess_id: str | None):
-            target = tool_n or key
-            self._emitter.emit(
-                f"Throttle: Capacity acquired, resuming {target}",
-                emoji="⚡",
-                tool_name="throttle",
-                session_id=sess_id,
+            tgt = tool_n or key
+            waited = time.monotonic() - start_mono
+            logger.debug(
+                "[throttle] Capacity acquired, resuming %s (waited %.2fs)",
+                tgt, waited,
             )
 
-        return self._capacity_pool.acquire(
-            request_id,
-            workload_type,
-            tool_name=tool_name,
-            session_id=session_id,
-            on_stall=_on_stall,
-            on_unblock=_on_unblock,
-        )
+            # One-time resolution notice if stale wait was alerted
+            if stale_reported:
+                self._emitter.emit(
+                    f"Throttle: Capacity acquired after stale wait, resuming {tgt}",
+                    emoji="⚡",
+                    session_id=sess_id,
+                )
+
+            # One-time recovery notice if capacity pool queue buildup cleared
+            with self._capacity_pool._cv:
+                remaining_ops = max(0, self._capacity_pool._next_ticket - self._capacity_pool._serving_ticket - 1)
+            if remaining_ops == 0 and self._queue_buildup_active.pop("capacity_pool", False):
+                self._emitter.emit(
+                    "Throttle: Capacity queue cleared, all operations running",
+                    emoji="⚡",
+                    session_id=sess_id,
+                )
+
+        try:
+            return self._capacity_pool.acquire(
+                request_id,
+                workload_type,
+                tool_name=tool_name,
+                session_id=session_id,
+                on_stall=_on_stall,
+                on_unblock=_on_unblock,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                logger.error("[throttle] Limiter error acquiring workload: %s", exc, exc_info=True)
+                self._emitter.emit(
+                    f"Throttle: Limiter error: {type(exc).__name__}: {str(exc)[:100]}",
+                    emoji="❌",
+                    session_id=session_id,
+                )
+            raise
 
     def release_workload(self, request_id: str) -> bool:
         """Release a previously acquired global workload reservation."""
@@ -1307,12 +1438,15 @@ class GlobalThrottle:
 
             if abs(capacity - old_cap) >= 0.5:
                 if capacity < old_cap:
+                    self._resource_pressure_active = True
                     self._emitter.emit(
                         f"Throttle: High host pressure detected, capacity clamped ({old_cap:.1f} → {capacity:.1f})",
                         emoji="⚠️",
                         session_id=session_id,
                     )
                 else:
+                    if self._resource_pressure_active and capacity >= (ceiling - 0.1):
+                        self._resource_pressure_active = False
                     self._emitter.emit(
                         f"Throttle: Host resources stable, capacity recovering ({old_cap:.1f} → {capacity:.1f})",
                         emoji="📈",
@@ -2289,9 +2423,16 @@ class GlobalThrottle:
                     kwargs, before_dispatch=acquire_capacity_at_dispatch,
                     session_id=session_id,
                 )
-        except BaseException:
+        except BaseException as exc:
             if capacity_acquired:
                 self.release_workload(capacity_request_id)
+            if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                logger.error("[throttle] Limiter error during dispatch: %s", exc, exc_info=True)
+                self._emitter.emit(
+                    f"Throttle: Limiter error during dispatch: {type(exc).__name__}: {str(exc)[:100]}",
+                    emoji="❌",
+                    session_id=session_id,
+                )
             raise
 
         if callable(next_call):
@@ -2334,12 +2475,22 @@ class GlobalThrottle:
             return next_call(tool_args)
 
         reservation_id = f"tool:{tool_call_id or uuid.uuid4().hex}"
-        self.acquire_workload(
-            reservation_id,
-            workload_type,
-            tool_name=tool_name,
-            session_id=session_id,
-        )
+        try:
+            self.acquire_workload(
+                reservation_id,
+                workload_type,
+                tool_name=tool_name,
+                session_id=session_id,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                logger.error("[throttle] Limiter error acquiring workload: %s", exc, exc_info=True)
+                self._emitter.emit(
+                    f"Throttle: Limiter error: {type(exc).__name__}: {str(exc)[:100]}",
+                    emoji="❌",
+                    session_id=session_id,
+                )
+            raise
 
         if workload_type == "subagent":
             # This is a start gate. Releasing before delegate_task runs avoids
@@ -2364,10 +2515,25 @@ class GlobalThrottle:
         session_id: str | None = None,
     ) -> None:
         ticket = bucket.claim_ticket()
+        start_wait = time.monotonic()
+        stale_alerted = False
         try:
             with bucket._cv:
+                queue_depth = max(0, ticket - bucket._serving_ticket)
+                if queue_depth >= QUEUE_BUILDUP_THRESHOLD:
+                    self._check_queue_buildup(bucket.key, queue_depth, session_id=session_id)
+
                 while ticket != bucket._serving_ticket:
+                    waited = time.monotonic() - start_wait
+                    if waited >= STALE_WAIT_THRESHOLD and not stale_alerted:
+                        stale_alerted = True
+                        self._emitter.emit(
+                            f"Throttle: Stale wait detected: {bucket.key} ticket #{ticket} waiting {waited:.0f}s",
+                            emoji="⚠️",
+                            session_id=session_id,
+                        )
                     bucket._cv.wait(timeout=1.0)
+
                 bucket._wait_until_dispatch_allowed_locked(
                     request_id,
                     estimated_tokens,
@@ -2381,6 +2547,9 @@ class GlobalThrottle:
             raise
         finally:
             bucket.advance_ticket()
+            queue_remaining = max(0, bucket._next_ticket - bucket._serving_ticket)
+            if queue_remaining == 0:
+                self._check_queue_cleared(bucket.key, session_id=session_id)
 
     def _dispatch_two_buckets(
         self,
@@ -2397,9 +2566,22 @@ class GlobalThrottle:
         ticket_mod = b_mod.claim_ticket()
         start_mono = time.monotonic()
         stall_reported = False
+        stale_reported = False
         try:
             with b_mod._cv:
+                queue_depth_mod = max(0, ticket_mod - b_mod._serving_ticket)
+                if queue_depth_mod >= QUEUE_BUILDUP_THRESHOLD:
+                    self._check_queue_buildup(b_mod.key, queue_depth_mod, session_id=session_id)
+
                 while ticket_mod != b_mod._serving_ticket:
+                    waited = time.monotonic() - start_mono
+                    if waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                        stale_reported = True
+                        self._emitter.emit(
+                            f"Throttle: Stale wait detected: {b_mod.key} ticket #{ticket_mod} waiting {waited:.0f}s",
+                            emoji="⚠️",
+                            session_id=session_id,
+                        )
                     b_mod._cv.wait(timeout=1.0)
 
                 while True:
@@ -2414,10 +2596,21 @@ class GlobalThrottle:
                         b_mod._last_wait_seconds = wait_for
                         b_mod._last_delay_reason = reason
                         total_waited = time.monotonic() - start_mono
-                        if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+                        logger.debug(
+                            "[throttle] Pacing (mod) %s/%s (wait=%.2fs, total=%.2fs, reason=%s)",
+                            provider, model, wait_for, total_waited, reason,
+                        )
+                        if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                            stale_reported = True
+                            self._emitter.emit(
+                                f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
+                                emoji="⚠️",
+                                session_id=session_id,
+                            )
+                        elif (wait_for >= UNUSUALLY_LONG_WAIT_THRESHOLD or total_waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
                             stall_reported = True
                             self._emitter.emit(
-                                f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                                f"Throttle: Extended wait for {provider}/{model} ({wait_for:.1f}s for {reason})...",
                                 emoji="⏳",
                                 session_id=session_id,
                             )
@@ -2428,7 +2621,19 @@ class GlobalThrottle:
             ticket_prov = b_prov.claim_ticket()
             try:
                 with b_prov._cv:
+                    queue_depth_prov = max(0, ticket_prov - b_prov._serving_ticket)
+                    if queue_depth_prov >= QUEUE_BUILDUP_THRESHOLD:
+                        self._check_queue_buildup(b_prov.key, queue_depth_prov, session_id=session_id)
+
                     while ticket_prov != b_prov._serving_ticket:
+                        waited = time.monotonic() - start_mono
+                        if waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                            stale_reported = True
+                            self._emitter.emit(
+                                f"Throttle: Stale wait detected: {b_prov.key} ticket #{ticket_prov} waiting {waited:.0f}s",
+                                emoji="⚠️",
+                                session_id=session_id,
+                            )
                         b_prov._cv.wait(timeout=1.0)
 
                     while True:
@@ -2443,10 +2648,21 @@ class GlobalThrottle:
                             b_prov._last_wait_seconds = wait_for
                             b_prov._last_delay_reason = reason
                             total_waited = time.monotonic() - start_mono
-                            if (wait_for >= 2.0 or total_waited >= 2.0) and not stall_reported:
+                            logger.debug(
+                                "[throttle] Pacing (prov) %s/%s (wait=%.2fs, total=%.2fs, reason=%s)",
+                                provider, model, wait_for, total_waited, reason,
+                            )
+                            if total_waited >= STALE_WAIT_THRESHOLD and not stale_reported:
+                                stale_reported = True
+                                self._emitter.emit(
+                                    f"Throttle: Stale wait detected for {provider}/{model} (waiting {total_waited:.0f}s)",
+                                    emoji="⚠️",
+                                    session_id=session_id,
+                                )
+                            elif (wait_for >= UNUSUALLY_LONG_WAIT_THRESHOLD or total_waited >= UNUSUALLY_LONG_WAIT_THRESHOLD) and not stall_reported:
                                 stall_reported = True
                                 self._emitter.emit(
-                                    f"Throttle: Pacing {provider}/{model} ({wait_for:.1f}s for {reason})...",
+                                    f"Throttle: Extended wait for {provider}/{model} ({wait_for:.1f}s for {reason})...",
                                     emoji="⏳",
                                     session_id=session_id,
                                 )
@@ -2460,22 +2676,27 @@ class GlobalThrottle:
                         b_mod._record_dispatch_locked(request_id, estimated_tokens, provider, model)
                     b_prov._record_dispatch_locked(request_id, estimated_tokens, provider, model)
                     self._persist_locked()
-                    if stall_reported:
-                        self._emitter.emit(
-                            f"Throttle: Pacing wait complete, dispatching {provider}/{model}",
-                            emoji="⚡",
-                            session_id=session_id,
-                        )
+
+                    logger.debug(
+                        "[throttle] Pacing wait complete, dispatching %s/%s (waited %.2fs)",
+                        provider, model, time.monotonic() - start_mono,
+                    )
             except BaseException:
                 b_prov.release_reservation(request_id)
                 raise
             finally:
                 b_prov.advance_ticket()
+                queue_rem_prov = max(0, b_prov._next_ticket - b_prov._serving_ticket)
+                if queue_rem_prov == 0:
+                    self._check_queue_cleared(b_prov.key, session_id=session_id)
         except BaseException:
             b_mod.release_reservation(request_id)
             raise
         finally:
             b_mod.advance_ticket()
+            queue_rem_mod = max(0, b_mod._next_ticket - b_mod._serving_ticket)
+            if queue_rem_mod == 0:
+                self._check_queue_cleared(b_mod.key, session_id=session_id)
 
     def _wait_until_dispatch_allowed_locked(
         self, request_id: str, context: dict[str, Any]
@@ -2677,11 +2898,19 @@ class GlobalThrottle:
 
             if is_429:
                 sess_id = str(kwargs.get("session_id") or "")
-                self._emitter.emit(
-                    f"Throttle: {provider} returned 429 rate limit, backing off...",
-                    emoji="🚨",
-                    session_id=sess_id,
-                )
+                now_mono = time.monotonic()
+                last_notice = self._last_429_notice.get(provider, 0.0)
+                if now_mono - last_notice >= BURST_429_COOLDOWN:
+                    self._last_429_notice[provider] = now_mono
+                    self._emitter.emit(
+                        f"Throttle: {provider} returned 429 rate limit, backing off...",
+                        emoji="🚨",
+                        session_id=sess_id,
+                    )
+                else:
+                    logger.info("[throttle] Burst 429 for %s suppressed from Discord telemetry", provider)
+                self._backoff_active[provider] = True
+
                 entry["rate_limit_429s"] = int(_num(entry.get("rate_limit_429s"), 0)) + 1
                 entry["last_429_at"] = now
 
@@ -2709,11 +2938,15 @@ class GlobalThrottle:
                 new_rpm, new_tpm = self._learner.get_effective_limits(
                     provider, model, settings.rpm, settings.tpm
                 )
-                self._emitter.emit(
-                    f"Throttle: Learned lower rate limit for {provider}/{model} ({new_rpm:.0f} RPM, {new_tpm:.0f} TPM)",
-                    emoji="🧠",
-                    session_id=sess_id,
-                )
+                prev_learned = self._last_learned_notice.get(f"{provider}::{model}")
+                new_limits = (round(new_rpm, 1), round(new_tpm, 1))
+                if prev_learned != new_limits:
+                    self._last_learned_notice[f"{provider}::{model}"] = new_limits
+                    self._emitter.emit(
+                        f"Throttle: Learned lower rate limit for {provider}/{model} ({new_rpm:.0f} RPM, {new_tpm:.0f} TPM)",
+                        emoji="🧠",
+                        session_id=sess_id,
+                    )
 
             if request_id:
                 self._pending.pop(request_id, None)
@@ -2766,6 +2999,10 @@ class GlobalThrottle:
                     b_adaptive["cooldown_until"] = 0.0
                     b_adaptive["successes_since_429"] = 0
                     b_adaptive["error_streak"] = 0
+                self._backoff_active.clear()
+                self._last_429_notice.clear()
+                self._queue_buildup_active.clear()
+                self._resource_pressure_active = False
                 self._persist_locked()
                 self._cv.notify_all()
             self._emitter.emit("Adaptive rate factor and cooldown reset", emoji="⚙️")

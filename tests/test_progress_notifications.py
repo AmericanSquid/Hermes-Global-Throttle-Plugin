@@ -258,6 +258,113 @@ class TestThrottleProgressIntegration(unittest.TestCase):
         self.throttle.handle_command("remove anthropic rpm")
         self.mock_emitter.emit.assert_called_with("Removed RPM override for anthropic", emoji="⚙️")
 
+    def test_routine_pacing_does_not_emit_to_discord(self):
+        """Routine pacing waits (< 10s) and dispatch completion do not emit to Discord."""
+        bucket = self.throttle._global_bucket
+        calls = [
+            (2.5, "rpm_interval", self.throttle._settings()),
+            (0.0, "ok", self.throttle._settings()),
+        ]
+
+        def fake_check(*args, **kwargs):
+            return calls.pop(0) if calls else (0.0, "ok", self.throttle._settings())
+
+        with patch.object(bucket, "_check_wait_locked", side_effect=fake_check):
+            with bucket._cv:
+                bucket._wait_until_dispatch_allowed_locked("req-1", 100, "anthropic", "claude")
+
+        # Discord emitter should NOT have been called for routine 2.5s pacing or completion
+        self.mock_emitter.emit.assert_not_called()
+
+    def test_unusually_long_wait_emits_to_discord(self):
+        """Unusually long waits (>= 10s) emit an extended wait alert to Discord."""
+        bucket = self.throttle._global_bucket
+        calls = [
+            (12.0, "rpd_quota", self.throttle._settings()),
+            (0.0, "ok", self.throttle._settings()),
+        ]
+
+        def fake_check(*args, **kwargs):
+            return calls.pop(0) if calls else (0.0, "ok", self.throttle._settings())
+
+        with patch.object(bucket, "_check_wait_locked", side_effect=fake_check):
+            with bucket._cv:
+                bucket._wait_until_dispatch_allowed_locked("req-long", 100, "anthropic", "claude")
+
+        # Emitted extended wait notice
+        self.mock_emitter.emit.assert_called_once()
+        call_args = self.mock_emitter.emit.call_args
+        self.assertIn("Extended wait for anthropic/claude", call_args[0][0])
+        self.assertEqual(call_args[1].get("emoji"), "⏳")
+
+    def test_burst_429_coalescing(self):
+        """Burst 429 errors from multiple in-flight requests coalesce into a single backoff alert."""
+        kwargs = {
+            "status_code": 429,
+            "provider": "openai",
+            "model": "gpt-4",
+            "session_id": "sess-1",
+        }
+        # Fire first 429
+        self.throttle.on_api_request_error(**kwargs)
+        # Count backoff emits (🚨)
+        calls_first = [c for c in self.mock_emitter.emit.call_args_list if c[1].get("emoji") == "🚨"]
+        self.assertEqual(len(calls_first), 1)
+
+        # Fire second and third 429 immediately
+        self.mock_emitter.reset_mock()
+        self.throttle.on_api_request_error(**kwargs)
+        self.throttle.on_api_request_error(**kwargs)
+        calls_burst = [c for c in self.mock_emitter.emit.call_args_list if c[1].get("emoji") == "🚨"]
+        self.assertEqual(len(calls_burst), 0, "Burst 429s within cooldown should be suppressed")
+
+    def test_backoff_one_time_recovery_notice(self):
+        """Recovering from 429 backoff emits a one-time recovery notice with ✅."""
+        self.throttle._backoff_active["openai"] = True
+        self.throttle.on_backoff_recovered("openai", "gpt-4")
+
+        self.mock_emitter.emit.assert_called_with(
+            "Throttle: Rate limit backoff recovered for openai/gpt-4, normal pacing restored",
+            emoji="✅",
+        )
+
+        # Subsequent call does not emit duplicate notice
+        self.mock_emitter.reset_mock()
+        self.throttle.on_backoff_recovered("openai", "gpt-4")
+        self.mock_emitter.emit.assert_not_called()
+
+    def test_queue_buildup_and_clear_recovery(self):
+        """Queue buildup (>= 3) emits a summary notice, and clearing emits a one-time notice."""
+        self.throttle._check_queue_buildup("anthropic", 4)
+        self.mock_emitter.emit.assert_called_with(
+            "Throttle: Queue buildup: 4 requests queued for anthropic",
+            emoji="⏳",
+            session_id=None,
+        )
+
+        # Repeating while active does not re-spam immediately
+        self.mock_emitter.reset_mock()
+        self.throttle._check_queue_buildup("anthropic", 4)
+        self.mock_emitter.emit.assert_not_called()
+
+        # Draining queue emits one-time notice
+        self.throttle._check_queue_cleared("anthropic")
+        self.mock_emitter.emit.assert_called_with(
+            "Throttle: Queue cleared for anthropic, normal pacing resumed",
+            emoji="⚡",
+            session_id=None,
+        )
+
+    def test_limiter_error_emits_alert(self):
+        """Internal limiter errors emit an alert with ❌."""
+        with patch.object(self.throttle, "acquire_workload", side_effect=RuntimeError("pool failure")):
+            with self.assertRaises(RuntimeError):
+                self.throttle.wrap_tool_execution(tool_name="bash", args={}, next_call=lambda x: x)
+
+        calls = [c for c in self.mock_emitter.emit.call_args_list if c[1].get("emoji") == "❌"]
+        self.assertTrue(len(calls) >= 1)
+        self.assertIn("Limiter error", calls[0][0][0])
+
 
 if __name__ == "__main__":
     unittest.main()
